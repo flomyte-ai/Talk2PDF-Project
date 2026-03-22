@@ -1,0 +1,171 @@
+%pip install markitdown sentence-transformers numpy gradio "mirascope[mistral]" mistralai
+
+# 0. Importation Phase
+import os
+import re
+import numpy as np
+import gradio as gr
+from markitdown import MarkItDown
+from sentence_transformers import SentenceTransformer
+from mirascope.core import mistral
+
+print("All imports successful!")
+
+# 1. Initialization Phase
+os.environ["MISTRAL_API_KEY"] = "u6toOcOWcGHyrnhLsCjVcqK8UxYWprct"
+
+md = MarkItDown()
+embed_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+
+# Global Storage
+current_chunks = []
+current_embeddings = None
+current_full_text = ""
+current_filename = ""
+
+# 2. ETL Process
+def process_document(file_name):
+    global current_chunks, current_embeddings, current_full_text, current_filename
+    if file_name is None:
+        return "Error: No file uploaded."
+
+    # Step A: Extraction (Markdown)
+    result = md.convert(file_name)
+    current_full_text = result.text_content
+    current_filename = os.path.basename(file_name)
+
+    # Step B: Transformation (Chunking)
+    size, overlap = 800, 150
+    current_chunks = [current_full_text[i:i + size] for i in range(0, len(current_full_text), size - overlap)]
+    
+    # Step C: Loading (Numpy Vector.Store)
+    embeddings = embed_model.encode(current_chunks)
+    current_embeddings = np.array(embeddings)
+    
+    return f"'{current_filename}' is now the active document ({len(current_chunks)} segments)."
+
+# 3. Analysis Phase
+def run_analysis(target="AI"):
+    if not current_full_text:
+        return "No data available.", 0, ""
+    
+    # RegEx
+    try:
+        keywords = [k.strip() for k in target.split(",")]
+        pattern = r'(?<![a-zA-Z])(?:' + '|'.join([re.escape(k) for k in keywords]) + r'|IA)(?![a-zA-Z])'
+        matches = re.findall(pattern, current_full_text, flags=re.IGNORECASE)
+        
+        sentence_pattern = r'([^.]*?' + pattern + r'[^.]*\.)'
+        sentences = re.findall(sentence_pattern, current_full_text, flags=re.IGNORECASE)
+        evidence = "\n\n---\n\n".join([str(s) for s in sentences[:5]])
+        
+        return "Scan Complete", len(matches), evidence
+
+    except Exception as e:
+        return f"Analysis Error: {str(e)}", 0, ""
+
+# 4. Multilingual Chat Phase
+@mistral.call(model="mistral-large-latest")
+def grounded_chat(context: str, question: str):
+    return f"""
+    Context (Original Language):
+    {context}
+    
+    User Question (English): {question}
+    
+    Instruction: You are a financial analyst. Answer the question in English using ONLY the context provided.
+    If the context is in French, translate the relevant findings into English in your response.
+    """
+
+def chat_func(message, history):
+    if current_embeddings is None:
+        return "Please upload a PDF first."
+
+    # Vector.Store Search
+    query_vec = embed_model.encode([message])
+    dot_prod = np.dot(current_embeddings, query_vec.T).flatten()
+    norms = np.linalg.norm(current_embeddings, axis=1) * np.linalg.norm(query_vec)
+    similarities = dot_prod / (norms + 1e-8)
+    
+    top_idx = np.argsort(similarities)[-3:][::-1]
+    context = "\n\n".join([current_chunks[i] for i in top_idx])
+    
+    response = grounded_chat(context=context, question=message)
+    return response.content
+
+# 5. Gradio Interface
+LOGO_URL = "https://www.prepa-laurea.com/wp-content/uploads/2023/05/Logo-Audencia.png"
+custom_css = """
+/* The background */
+.gradio-container { 
+    background-color: #003366 !important; 
+    background-image: linear-gradient(180deg, #004c99 0%, #003366 100%);
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+/* The Logo Banner */
+.banner-container {
+    width: 100% !important;
+    background: white;
+    padding: 20px 0;
+    margin-top: -20px;
+    margin-bottom: 30px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    border-bottom: 4px solid #000;
+}
+
+.banner-container img {
+    height: 50px;
+    margin-bottom: 10px;
+}
+
+/* The Card Styling */
+.sidebar-box, .chat-window {
+    background: white !important;
+    border-radius: 12px !important;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.3) !important;
+}
+"""
+
+with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=custom_css) as demo:
+    gr.HTML(f"""
+        <div class="banner-container">
+            <img src="{LOGO_URL}" alt="L'Oréal Banner">
+            <h1 style='font-size: 40px; font-weight: 900; color: #000; margin: 0;'>
+                TALK 2 FINANCIAL STATEMENTS
+            </h1>
+        </div>
+    """)
+
+    with gr.Row():
+        # LEFT: Document Analysis
+        with gr.Column(scale=1, elem_classes="sidebar-box"):
+            gr.Markdown("### Document Upload")
+            file_input = gr.File(label="Drop your PDF here", file_types=[".pdf"])
+            load_btn = gr.Button("Upload Document", variant="primary")
+            status_msg = gr.Textbox(label="Status", interactive=False, placeholder="Waiting for upload...")
+            
+            gr.Markdown("---")
+            gr.Markdown("### Keyword(s) Scan")
+            word_to_find = gr.Textbox(label="Track Keyword(s)", value="AI")
+            count_btn = gr.Button("Run Frequency Count", variant="primary")
+            with gr.Row():
+                count_num = gr.Number(label="Total Mentions", precision=0)
+            snippets = gr.Textbox(label="Evidence Snippets", lines=8, max_lines=10)
+
+        # RIGHT: Chat with Document
+        with gr.Column(scale=2, elem_classes="chat-window"):
+            gr.ChatInterface(
+                fn=chat_func,
+                title=" Chat with your Document",
+                examples=["What is the company's AI strategy?", "Summarize the financial risks.", "What are the key sustainability goals?"],
+                type="messages"
+            )
+
+    load_btn.click(process_document, inputs=file_input, outputs=status_msg)
+    count_btn.click(run_analysis, inputs=word_to_find, outputs=[status_msg, count_num, snippets])
+
+if __name__ == "__main__":
+    demo.launch()
